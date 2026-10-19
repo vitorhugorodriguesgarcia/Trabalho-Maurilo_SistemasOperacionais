@@ -1,9 +1,4 @@
-/*
- *   CABO DE GUERRA (MULTIPLAYER, 2 PROCESSOS) - versao simplificada
- *
- *   Compilacao (Dev-C++ / MinGW):
- *       gcc cabo_de_CAULE_simples.c -o jogo.exe -lws2_32 -lpthread
- */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,8 +69,6 @@ SOCKET sock_conexao = INVALID_SOCKET;
 pthread_mutex_t mutex_jogo = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  cond_jogo  = PTHREAD_COND_INITIALIZER;
 
-/* ========================== Utilitarios ========================== */
-
 void set_cor(WORD cor) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), cor);
 }
@@ -108,8 +101,6 @@ bool ler_linha_teclado(char *buf, int tam) {
     trim(buf);
     return true;
 }
-
-/* Mostra um prompt e le uma linha. */
 bool perguntar(const char *prompt, char *buf, int tam) {
     set_cor(COR_ALERTA);
     printf("%s", prompt);
@@ -117,8 +108,6 @@ bool perguntar(const char *prompt, char *buf, int tam) {
     fflush(stdout);
     return ler_linha_teclado(buf, tam);
 }
-
-/* Le um numero entre min e max (Enter = padrao). */
 bool ler_numero(const char *prompt, int min, int max, int padrao, int *saida) {
     char linha[TAM_LINHA], *fim;
     long v;
@@ -139,8 +128,6 @@ void esperar_enter(void) {
     fflush(stdout);
     ler_linha_teclado(lixo, sizeof(lixo));
 }
-
-/* ========================== Regras ========================== */
 
 bool dado_valido(int d) { return (d >= 1 && d <= 5) || d == DADO_CRITICO; }
 
@@ -175,9 +162,6 @@ void log_evento(const char *fmt, ...) {
     }
     strcpy(log_eventos[log_qtd++], linha);
 }
-
-/* ========================== Interface ========================== */
-
 void desenhar_cabo(void) {
     int i, pad;
 
@@ -194,8 +178,7 @@ void desenhar_cabo(void) {
     printf("  %d x %d  ", placar[1], placar[2]);
     set_cor(COR_J2);
     printf("%s\n\n", nome[2]);
-
-    /* Corda: nomes nas pontas, marca [O] na posicao atual */
+       
     pad = LARGURA_CORDA - (int)strlen(nome[1]) - (int)strlen(nome[2]);
     if (pad < 1) pad = 1;
     printf("  ");
@@ -213,13 +196,9 @@ void desenhar_cabo(void) {
         else                        { set_cor(COR_CINZA);  printf("---"); }
     }
     printf("\n\n");
-
-    /* Eventos */
     set_cor(COR_PADRAO);
     for (i = 0; i < log_qtd; i++) printf("  %.72s\n", log_eventos[i]);
     for (i = log_qtd; i < TAM_LOG; i++) printf("\n");
-
-    /* Acao */
     printf("\n");
     if (jogo_ativo) {
         if (vez == meu_id) {
@@ -302,8 +281,6 @@ void finalizar_rodada(int vencedor) {
     desenhar_cabo();
     pthread_cond_broadcast(&cond_jogo);
 }
-
-/* ========================== Rede ========================== */
 
 bool enviar_msg(char tipo, int id, int valor, int pos, char status, const char *texto) {
     char msg[TAM_LINHA];
@@ -464,8 +441,6 @@ void* thread_receber_mensagens(void* arg) {
     return NULL;
 }
 
-/* ========================== Conexao ========================== */
-
 void mostrar_ips_locais(void) {
     char host[256];
     struct hostent *he;
@@ -560,8 +535,6 @@ bool iniciar_cliente(void) {
     return true;
 }
 
-/* ========================== Entrada ========================== */
-
 int interpretar_comando(char *linha, char **texto) {
     *texto = NULL;
     if (linha[0] == '\0') return ACAO_JOGAR;
@@ -572,8 +545,6 @@ int interpretar_comando(char *linha, char **texto) {
     }
     return ACAO_INVALIDA;
 }
-
-/* ========================== Main ========================== */
 
 int main(void) {
     WSADATA wsa;
@@ -592,7 +563,6 @@ int main(void) {
         return 1;
     }
 
-    /* Menu */
     system("cls");
     set_cor(COR_J1);
     printf("== CABO DE GUERRA ==\n");
@@ -607,7 +577,6 @@ int main(void) {
     oponente = (meu_id == 1) ? 2 : 1;
     printf("\n");
 
-    /* Configuracao */
     snprintf(linha, sizeof(linha), "Seu nome [Enter = Jogador %d]: ", meu_id);
     if (!perguntar(linha, linha, sizeof(linha))) { WSACleanup(); return 1; }
     sanitizar_texto(linha);
@@ -741,7 +710,6 @@ int main(void) {
         pthread_mutex_unlock(&mutex_jogo);
     }
 
-    /* Encerramento */
     pthread_mutex_lock(&mutex_jogo);
     if (!pular_espera) {
         pthread_mutex_unlock(&mutex_jogo);
