@@ -81,5 +81,6 @@ M sua mensagem: Envia uma mensagem no chat.
 S: Sai da partida.
 
 ✒️ Autores
-Vitor Hugo Rodrigues Garcia - 
+Vitor Hugo Rodrigues Garcia 
+Livia :)
 
