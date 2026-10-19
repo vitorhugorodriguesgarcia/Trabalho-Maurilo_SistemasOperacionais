@@ -65,3 +65,25 @@ gcc servidor_dados.c -o servidor_dados.exe -lws2_32
 
 # Compilar o Jogo Cabo de Guerra
 gcc cabo_de_CAULE_simples.c -o cabo_de_guerra.exe -lws2_32 -lpthread
+
+
+
+🎮 Como Jogar (Cabo de Guerra)
+Execute a aplicação em duas instâncias (ou em computadores na mesma rede).
+
+O Jogador 1 seleciona a opção 1 - Criar sala e informa a porta (padrão 8888).
+
+O Jogador 2 seleciona a opção 2 - Entrar em sala e informa o IP do Jogador 1.
+
+Controles na sua vez:
+
+<ENTER>: Puxa a corda (rola o dado).
+
+M sua mensagem: Envia uma mensagem no chat.
+
+S: Sai da partida.
+
+✒️ Autores
+Vitor Hugo Rodrigues Garcia - GitHub[cite: 1]
+
+Maurilo (Trabalho acadêmico de Sistemas Operacionais)[cite: 1]
