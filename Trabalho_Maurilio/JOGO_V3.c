@@ -1,0 +1,1024 @@
+#define _WIN32_WINNT 0x0601
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <time.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <conio.h>
+#include <pthread.h>
+
+#define PORTA_PADRAO     8888
+#define TAM_LINHA        128
+#define TAM_NOME         16
+#define TAM_TEXTO        60
+#define TAM_CABO         10          
+#define CENTRO           5
+#define RODADAS_PADRAO   4
+#define RODADAS_MAX      10
+#define VERSAO_PROTOCOLO 4
+#define DADO_CRITICO     9           
+#define TAM_LOG          6
+#define TAM_CONTA        16
+#define MAX_SOMA         12          /* maior numero nas somas/subtracoes */
+#define MAX_MULT         6           /* maior numero nas multiplicacoes   */
+#define TAM_LOG_LINHA    100
+#define LARGURA_CORDA    ((TAM_CABO + 1) * 3)
+
+#define COR_PADRAO  7
+#define COR_J1      11
+#define COR_J2      13
+#define COR_OK      10
+#define COR_ALERTA  14
+#define COR_ERRO    12
+#define COR_CINZA   8
+
+enum Fim  { FIM_NENHUM = 0, FIM_VENCI, FIM_PERDI, FIM_OPONENTE_SAIU,
+            FIM_DESISTI, FIM_CONEXAO_PERDIDA, FIM_ERRO_PROTOCOLO };
+
+enum Acao { ACAO_NENHUMA = 0, ACAO_JOGAR, ACAO_RESPONDER, ACAO_SAIR, ACAO_CHAT, ACAO_INVALIDA };
+
+enum Leitura { LEI_LINHA = 1, LEI_MUDOU, LEI_FIM };
+
+typedef struct {
+    char tipo;
+    int  id, valor, pos;
+    char status;
+    char texto[TAM_TEXTO + 1];
+} Mensagem;
+
+int  posicao_cabo        = CENTRO;   
+int  vez                 = 1;
+int  meu_id              = 0;
+int  jogo_ativo          = 1;
+int  motivo_fim          = FIM_NENHUM;
+int  placar[3]           = {0, 0, 0};
+int  rodada_atual        = 1;
+int  rodadas_para_vencer = RODADAS_PADRAO;
+int  primeiro_jogador    = 1;
+char nome[3][TAM_NOME];
+char log_eventos[TAM_LOG][TAM_LOG_LINHA];
+int  log_qtd             = 0;
+
+/* --- Conta de matematica (disputa pela puxada) --- */
+int      questao_ativa   = 0;   /* 1 = dado rolado, esperando alguem acertar */
+int      seq_questao     = 0;   /* numero da questao (evita respostas atrasadas) */
+int      dado_atual      = 0;
+int      resp_correta    = 0;
+int      ja_respondi     = 0;   /* (cliente) ja mandei a resposta certa      */
+char     texto_conta[TAM_CONTA] = "";
+unsigned epoca           = 0;   /* muda quando a questao abre/fecha          */
+unsigned desenho_id      = 0;   /* muda a cada redesenho da tela             */
+
+int    conexao_ativa     = 1;   
+int    resposta_oponente = 0;   
+SOCKET sock_conexao      = INVALID_SOCKET;
+
+pthread_mutex_t mutex_jogo = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cond_jogo  = PTHREAD_COND_INITIALIZER;
+
+void set_cor(WORD cor) {
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), cor);
+}
+
+void trim(char *s) {
+    char *ini = s;
+    size_t len;
+
+    while (*ini && isspace((unsigned char)*ini)) ini++;
+    if (ini != s) memmove(s, ini, strlen(ini) + 1);
+    len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) s[--len] = '\0';
+}
+
+void sanitizar_texto(char *s) {
+    char *w = s;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 32 && c != 127) *w++ = (char)c;
+    }
+    *w = '\0';
+}
+
+bool ler_linha_teclado(char *buf, int tam) {
+    if (fgets(buf, tam, stdin) == NULL) return false;
+    if (strchr(buf, '\n') == NULL) {            
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) { }
+    }
+    buf[strcspn(buf, "\n")] = '\0';
+    trim(buf);
+    return true;
+}
+
+bool perguntar(const char *prompt, char *buf, int tam) {
+    set_cor(COR_ALERTA);
+    printf("%s", prompt);
+    set_cor(COR_PADRAO);
+    fflush(stdout);
+    return ler_linha_teclado(buf, tam);
+}
+
+bool ler_numero(const char *prompt, int min, int max, int padrao, int *saida) {
+    char linha[TAM_LINHA], *fim;
+    long v;
+
+    while (1) {
+        if (!perguntar(prompt, linha, sizeof(linha))) return false;
+        if (linha[0] == '\0') { *saida = padrao; return true; }
+        v = strtol(linha, &fim, 10);
+        if (*fim == '\0' && v >= min && v <= max) { *saida = (int)v; return true; }
+        set_cor(COR_ERRO);
+        printf("Valor invalido (%d a %d).\n", min, max);
+        set_cor(COR_PADRAO);
+    }
+}
+
+void esperar_enter(void) {
+    char lixo[TAM_LINHA];
+    printf("\nPressione ENTER para sair...");
+    fflush(stdout);
+    ler_linha_teclado(lixo, sizeof(lixo));
+}
+
+bool dado_valido(int d) { return (d >= 1 && d <= 5) || d == DADO_CRITICO; }
+
+int rolar_dado(void) {
+    int d = (rand() % 6) + 1;
+    return (d == 6) ? DADO_CRITICO : d;
+}
+
+int calcular_posicao(int pos, int id, int dado) {
+    pos += (id == 1) ? -dado : dado;
+    if (pos < 0) pos = 0;
+    if (pos > TAM_CABO) pos = TAM_CABO;
+    return pos;
+}
+
+bool venceu_rodada(int id, int pos) {
+    return (id == 1 && pos <= 0) || (id == 2 && pos >= TAM_CABO);
+}
+
+void log_evento(const char *fmt, ...) {
+    char linha[TAM_LOG_LINHA];
+    va_list ap;
+    int i;
+
+    va_start(ap, fmt);
+    vsnprintf(linha, sizeof(linha), fmt, ap);
+    va_end(ap);
+
+    if (log_qtd == TAM_LOG) {
+        for (i = 1; i < TAM_LOG; i++) strcpy(log_eventos[i - 1], log_eventos[i]);
+        log_qtd--;
+    }
+    strcpy(log_eventos[log_qtd++], linha);
+}
+
+void desenhar_cabo(void) {
+    int i, pad;
+
+    desenho_id++;
+    system("cls");
+
+    set_cor(COR_PADRAO);
+    printf("== CABO DE GUERRA == Rodada %d (vence quem ganhar %d)\n\n",
+           rodada_atual, rodadas_para_vencer);
+
+    printf("  ");
+    set_cor(COR_J1);
+    printf("%s", nome[1]);
+    set_cor(COR_PADRAO);
+    printf("  %d x %d  ", placar[1], placar[2]);
+    set_cor(COR_J2);
+    printf("%s\n\n", nome[2]);
+
+    pad = LARGURA_CORDA - (int)strlen(nome[1]) - (int)strlen(nome[2]);
+    if (pad < 1) pad = 1;
+    printf("  ");
+    set_cor(COR_J1);
+    printf("%s", nome[1]);
+    printf("%*s", pad, "");
+    set_cor(COR_J2);
+    printf("%s\n  ", nome[2]);
+
+    for (i = 0; i <= TAM_CABO; i++) {
+        if (i == posicao_cabo)  { set_cor(COR_ALERTA); printf("[O]"); }
+        else if (i == 0)        { set_cor(COR_J1);     printf("###"); }
+        else if (i == TAM_CABO) { set_cor(COR_J2);     printf("###"); }
+        else if (i == CENTRO)   { set_cor(COR_CINZA);  printf("-|-"); }
+        else                    { set_cor(COR_CINZA);  printf("---"); }
+    }
+    printf("\n\n");
+
+    set_cor(COR_PADRAO);
+    for (i = 0; i < log_qtd; i++) printf("  %.72s\n", log_eventos[i]);
+    for (i = log_qtd; i < TAM_LOG; i++) printf("\n");
+    printf("\n");
+
+    if (jogo_ativo) {
+        if (questao_ativa) {
+            set_cor(COR_ALERTA);
+            printf("DADO: %d%s - quem acertar primeiro puxa %d casa(s)!\n",
+                   dado_atual, (dado_atual >= DADO_CRITICO) ? " (CRITICO!)" : "", dado_atual);
+            set_cor(COR_OK);
+            printf("CONTA:  %s = ?\n", texto_conta);
+            if (ja_respondi) {
+                set_cor(COR_ALERTA);
+                printf("Resposta certa enviada! Aguardando confirmacao...\n");
+            } else {
+                printf("Digite a resposta | M texto = chat | S = sair\n> ");
+            }
+        } else if (vez == meu_id) {
+            set_cor(COR_OK);
+            printf("SUA VEZ: ENTER = rolar o dado | M texto = chat | S = sair\n> ");
+        } else {
+            set_cor(COR_ALERTA);
+            printf("Aguardando %s rolar o dado...\n", nome[vez]);
+        }
+    }
+    set_cor(COR_PADRAO);
+    fflush(stdout);
+}
+
+void mostrar_fim(void) {
+    int outro = (meu_id == 1) ? 2 : 1;
+
+    printf("\n");
+    switch (motivo_fim) {
+    case FIM_VENCI:
+        set_cor(COR_OK);
+        printf("VOCE VENCEU! (%d x %d)\n", placar[meu_id], placar[outro]);
+        break;
+    case FIM_PERDI:
+        set_cor(COR_ERRO);
+        printf("VOCE PERDEU. (%d x %d)\n", placar[meu_id], placar[outro]);
+        break;
+    case FIM_OPONENTE_SAIU:
+        set_cor(COR_ALERTA);
+        printf("O oponente saiu. Voce venceu por W.O.!\n");
+        break;
+    case FIM_DESISTI:
+        printf("Voce saiu da partida.\n");
+        break;
+    case FIM_CONEXAO_PERDIDA:
+        set_cor(COR_ERRO);
+        printf("Conexao perdida. Partida encerrada.\n");
+        break;
+    case FIM_ERRO_PROTOCOLO:
+        set_cor(COR_ERRO);
+        printf("Erro de comunicacao. Partida encerrada.\n");
+        break;
+    default:
+        break;
+    }
+    set_cor(COR_PADRAO);
+    fflush(stdout);
+}
+
+void encerrar_jogo(int motivo) {
+    jogo_ativo = 0;
+    questao_ativa = 0;
+    epoca++;
+    motivo_fim = motivo;
+    desenhar_cabo();
+    mostrar_fim();
+    pthread_cond_broadcast(&cond_jogo);
+}
+
+void finalizar_rodada(int vencedor) {
+    int outro_do_primeiro = (primeiro_jogador == 1) ? 2 : 1;
+
+    placar[vencedor]++;
+    log_evento("%s venceu a rodada %d!", nome[vencedor], rodada_atual);
+
+    if (placar[vencedor] >= rodadas_para_vencer) {
+        encerrar_jogo(vencedor == meu_id ? FIM_VENCI : FIM_PERDI);
+        return;
+    }
+
+    rodada_atual++;
+    posicao_cabo = CENTRO;
+    vez = (rodada_atual % 2 == 1) ? primeiro_jogador : outro_do_primeiro;
+    log_evento("Rodada %d - comeca %s.", rodada_atual, nome[vez]);
+    desenhar_cabo();
+    pthread_cond_broadcast(&cond_jogo);
+}
+
+bool enviar_msg(char tipo, int id, int valor, int pos, char status, const char *texto) {
+    char msg[TAM_LINHA];
+    int total, enviados = 0, r;
+
+    snprintf(msg, sizeof(msg), "%c:%d:%d:%d:%c:%.*s\n",
+             tipo, id, valor, pos, status, TAM_TEXTO, texto ? texto : "");
+    total = (int)strlen(msg);
+    while (enviados < total) {
+        r = send(sock_conexao, msg + enviados, total - enviados, 0);
+        if (r == SOCKET_ERROR || r == 0) return false;
+        enviados += r;
+    }
+    return true;
+}
+
+bool receber_linha(char *buf, int tam) {
+    int n = 0;
+    char ch;
+
+    while (1) {
+        int r = recv(sock_conexao, &ch, 1, 0);
+        if (r <= 0) return false;
+        if (ch == '\n') { buf[n] = '\0'; return true; }
+        if (ch != '\r' && n < tam - 1) buf[n++] = ch;
+    }
+}
+
+bool decodificar_msg(const char *linha, Mensagem *m) {
+    char tipo, status;
+    int n = 0;
+
+    memset(m, 0, sizeof(*m));
+    if (sscanf(linha, "%c:%d:%d:%d:%c:%n", &tipo, &m->id, &m->valor, &m->pos,
+               &status, &n) < 5 || n == 0)
+        return false;
+    if (m->id != 1 && m->id != 2) return false;
+
+    m->tipo   = tipo;
+    m->status = status;
+    strncpy(m->texto, linha + n, TAM_TEXTO);
+    m->texto[TAM_TEXTO] = '\0';
+    sanitizar_texto(m->texto);
+    return true;
+}
+
+/* ---------- Conta de matematica ---------- */
+
+void gerar_conta(char *saida, size_t tam, int *resposta) {
+    int a, b;
+
+    switch (rand() % 3) {
+    case 0:
+        a = 1 + rand() % MAX_SOMA;
+        b = 1 + rand() % MAX_SOMA;
+        snprintf(saida, tam, "%d+%d", a, b);
+        *resposta = a + b;
+        break;
+    case 1:
+        a = 2 + rand() % MAX_SOMA;
+        b = 1 + rand() % (a - 1);           /* resultado nunca negativo */
+        snprintf(saida, tam, "%d-%d", a, b);
+        *resposta = a - b;
+        break;
+    default:
+        a = 2 + rand() % (MAX_MULT - 1);
+        b = 2 + rand() % (MAX_MULT - 1);
+        snprintf(saida, tam, "%dx%d", a, b);
+        *resposta = a * b;
+        break;
+    }
+}
+
+bool avaliar_conta(const char *s, int *resultado) {
+    int a, b, n = 0;
+    char op;
+
+    if (sscanf(s, "%d%c%d%n", &a, &op, &b, &n) != 3 || s[n] != '\0') return false;
+    if (a < 0 || a > 99 || b < 0 || b > 99) return false;
+    switch (op) {
+    case '+': *resultado = a + b; return true;
+    case '-': *resultado = a - b; return true;
+    case 'x': *resultado = a * b; return true;
+    default:  return false;
+    }
+}
+
+void abrir_questao(int dado, const char *conta, int resposta) {
+    questao_ativa = 1;
+    dado_atual    = dado;
+    resp_correta  = resposta;
+    ja_respondi   = 0;
+    snprintf(texto_conta, sizeof(texto_conta), "%s", conta);
+    epoca++;
+}
+
+/* Aplica o resultado da disputa (nos dois lados, com o mutex travado). */
+void aplicar_puxada(int vencedor, int nova_pos, bool venceu) {
+    int dado = dado_atual;
+
+    questao_ativa = 0;
+    epoca++;
+    posicao_cabo = nova_pos;
+    log_evento("%s acertou primeiro e puxou %d%s",
+               (vencedor == meu_id) ? "Voce" : nome[vencedor], dado,
+               (dado >= DADO_CRITICO) ? " (CRITICO!)" : "");
+
+    if (venceu) {
+        finalizar_rodada(vencedor);
+        return;
+    }
+    vez = (vez == 1) ? 2 : 1;               /* o outro rola o proximo dado */
+    desenhar_cabo();
+    pthread_cond_broadcast(&cond_jogo);
+}
+
+/* So o Jogador 1 (anfitriao) decide quem acertou primeiro. */
+void resolver_puxada(int vencedor) {
+    int  nova   = calcular_posicao(posicao_cabo, vencedor, dado_atual);
+    bool venceu = venceu_rodada(vencedor, nova);
+    char w[2]   = { (char)('0' + vencedor), '\0' };
+
+    if (!enviar_msg('P', meu_id, dado_atual, nova, venceu ? 'V' : 'N', w)) {
+        encerrar_jogo(FIM_CONEXAO_PERDIDA);
+        return;
+    }
+    aplicar_puxada(vencedor, nova, venceu);
+}
+
+bool handshake(void) {
+    char buf[TAM_LINHA];
+    Mensagem m;
+    int oponente = (meu_id == 1) ? 2 : 1;
+
+    if (!enviar_msg('H', meu_id, VERSAO_PROTOCOLO, 0, 'N', nome[meu_id]) ||
+        !receber_linha(buf, sizeof(buf)) || !decodificar_msg(buf, &m)) {
+        printf("Handshake falhou ou conexao encerrada.\n");
+        return false;
+    }
+    if (m.tipo != 'H' || m.id != oponente) {
+        printf("O outro lado nao e um jogador %d valido.\n", oponente);
+        return false;
+    }
+    if (m.valor != VERSAO_PROTOCOLO) {
+        printf("Versao incompativel (local %d, remota %d).\n", VERSAO_PROTOCOLO, m.valor);
+        return false;
+    }
+    trim(m.texto);
+    if (m.texto[0] == '\0') snprintf(m.texto, sizeof(m.texto), "Jogador %d", oponente);
+    snprintf(nome[oponente], TAM_NOME, "%s", m.texto);
+
+    if (meu_id == 1) {
+        primeiro_jogador = (rand() % 2) + 1;
+        if (!enviar_msg('G', meu_id, rodadas_para_vencer, primeiro_jogador, 'N', "")) {
+            printf("Falha ao enviar configuracao.\n");
+            return false;
+        }
+    } else {
+        if (!receber_linha(buf, sizeof(buf)) || !decodificar_msg(buf, &m)
+            || m.tipo != 'G' || m.id != 1
+            || m.valor < 1 || m.valor > RODADAS_MAX
+            || (m.pos != 1 && m.pos != 2)) {
+            printf("Configuracao invalida.\n");
+            return false;
+        }
+        rodadas_para_vencer = m.valor;
+        primeiro_jogador    = m.pos;
+    }
+    vez = primeiro_jogador;
+    return true;
+}
+
+bool tratar_mensagem_recebida(const Mensagem *m, int oponente) {
+    switch (m->tipo) {
+    case 'S':
+        encerrar_jogo(FIM_OPONENTE_SAIU);
+        return false;
+
+    case 'C':
+        log_evento("%s: %s", nome[oponente], m->texto);
+        desenhar_cabo();
+        return true;
+
+    case 'Q': {                                  /* oponente rolou o dado */
+        int resp;
+        if (questao_ativa || vez != oponente || !dado_valido(m->valor)
+            || m->pos != seq_questao + 1 || !avaliar_conta(m->texto, &resp)) {
+            encerrar_jogo(FIM_ERRO_PROTOCOLO);
+            return false;
+        }
+        seq_questao = m->pos;
+        abrir_questao(m->valor, m->texto, resp);
+        log_evento("%s rolou %d%s! Resolva a conta!", nome[oponente], m->valor,
+                   (m->valor >= DADO_CRITICO) ? " (CRITICO!)" : "");
+        desenhar_cabo();
+        pthread_cond_broadcast(&cond_jogo);
+        return true;
+    }
+
+    case 'A':                                    /* cliente diz que acertou */
+        if (meu_id != 1) {
+            encerrar_jogo(FIM_ERRO_PROTOCOLO);
+            return false;
+        }
+        /* Se a questao ja foi fechada (o anfitriao foi mais rapido), ignora. */
+        if (questao_ativa && m->pos == seq_questao && m->valor == resp_correta)
+            resolver_puxada(oponente);
+        return true;
+
+    case 'P': {                                  /* anfitriao anuncia quem puxou */
+        int vencedor = m->texto[0] - '0';
+        if (meu_id != 2 || !questao_ativa
+            || (vencedor != 1 && vencedor != 2) || m->texto[1] != '\0'
+            || (m->status != 'N' && m->status != 'V')
+            || m->valor != dado_atual
+            || m->pos != calcular_posicao(posicao_cabo, vencedor, dado_atual)
+            || (m->status == 'V') != venceu_rodada(vencedor, m->pos)) {
+            encerrar_jogo(FIM_ERRO_PROTOCOLO);
+            return false;
+        }
+        aplicar_puxada(vencedor, m->pos, m->status == 'V');
+        return true;
+    }
+
+    default:
+        encerrar_jogo(FIM_ERRO_PROTOCOLO);
+        return false;
+    }
+}
+
+void* thread_receber_mensagens(void *arg) {
+    char buffer[TAM_LINHA];
+    Mensagem m;
+    int oponente = (meu_id == 1) ? 2 : 1;
+    (void)arg;
+
+    while (1) {
+        bool ok = receber_linha(buffer, sizeof(buffer));
+        bool continuar = true;
+
+        pthread_mutex_lock(&mutex_jogo);
+
+        if (!ok || !decodificar_msg(buffer, &m) || m.id != oponente) {
+            if (jogo_ativo) encerrar_jogo(ok ? FIM_ERRO_PROTOCOLO : FIM_CONEXAO_PERDIDA);
+            continuar = false;
+        } else if (m.tipo == 'R') {                  
+            resposta_oponente = (m.status == 'S') ? 1 : 2;
+        } else if (jogo_ativo) {                     
+            continuar = tratar_mensagem_recebida(&m, oponente);
+        }                                            
+
+        if (!continuar) conexao_ativa = 0;
+        pthread_cond_broadcast(&cond_jogo);          
+        pthread_mutex_unlock(&mutex_jogo);
+        if (!continuar) break;
+    }
+    return NULL;
+}
+
+void mostrar_ips_locais(void) {
+    char host[256], ip[INET_ADDRSTRLEN];
+    struct hostent *he;
+    int i;
+
+    if (gethostname(host, sizeof(host)) == 0 &&
+        (he = gethostbyname(host)) != NULL && he->h_addrtype == AF_INET) {
+        printf("Seu IP (passe ao Jogador 2):\n");
+        for (i = 0; he->h_addr_list[i] != NULL; i++) {
+            if (inet_ntop(AF_INET, he->h_addr_list[i], ip, sizeof(ip)) != NULL)
+                printf("  %s\n", ip);
+        }
+    }
+}
+
+bool iniciar_servidor(void) {
+    SOCKET server_fd;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    int opt = 1;
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == INVALID_SOCKET) {
+        printf("Erro ao criar socket (WSA %d).\n", WSAGetLastError());
+        return false;
+    }
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port        = htons(PORTA_PADRAO);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) == SOCKET_ERROR ||
+        listen(server_fd, 1) == SOCKET_ERROR) {
+        printf("Erro ao abrir a porta %d (WSA %d). Porta em uso?\n", PORTA_PADRAO, WSAGetLastError());
+        closesocket(server_fd);
+        return false;
+    }
+
+    printf("\n");
+    mostrar_ips_locais();
+    printf("\nAguardando o Jogador 2 na porta %d...\n", PORTA_PADRAO);
+
+    sock_conexao = accept(server_fd, (struct sockaddr*)&address, &addrlen);
+    closesocket(server_fd);
+
+    if (sock_conexao == INVALID_SOCKET) {
+        printf("Erro no accept (WSA %d).\n", WSAGetLastError());
+        return false;
+    }
+    printf("Jogador 2 conectado!\n");
+    return true;
+}
+
+bool iniciar_cliente(void) {
+    struct sockaddr_in address;
+    char ip_servidor[TAM_LINHA];
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port   = htons(PORTA_PADRAO);
+
+    while (1) {
+        if (!perguntar("IP do Jogador 1 [Enter = 127.0.0.1]: ", ip_servidor, sizeof(ip_servidor)))
+            return false;
+        if (ip_servidor[0] == '\0') strcpy(ip_servidor, "127.0.0.1");
+        if (inet_pton(AF_INET, ip_servidor, &address.sin_addr) == 1) break;
+        set_cor(COR_ERRO);
+        printf("IP invalido!\n");
+        set_cor(COR_PADRAO);
+    }
+
+    sock_conexao = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_conexao == INVALID_SOCKET) {
+        printf("Erro ao criar socket (WSA %d).\n", WSAGetLastError());
+        return false;
+    }
+
+    printf("Conectando a %s:%d...\n", ip_servidor, PORTA_PADRAO);
+    if (connect(sock_conexao, (struct sockaddr*)&address, sizeof(address)) == SOCKET_ERROR) {
+        printf("Nao foi possivel conectar (WSA %d). A sala ja foi criada?\n", WSAGetLastError());
+        closesocket(sock_conexao);
+        sock_conexao = INVALID_SOCKET;
+        return false;
+    }
+    printf("Conectado!\n");
+    return true;
+}
+
+int interpretar_comando(char *linha, char **texto) {
+    *texto = NULL;
+    if (linha[0] == '\0') return ACAO_JOGAR;
+    if ((linha[0] == 's' || linha[0] == 'S') && linha[1] == '\0') return ACAO_SAIR;
+    if ((linha[0] == 'm' || linha[0] == 'M') && linha[1] == ' ') {
+        trim(linha + 2);
+        if (linha[2] != '\0') { *texto = linha + 2; return ACAO_CHAT; }
+    }
+    return ACAO_INVALIDA;
+}
+
+int interpretar_resposta(char *linha, char **texto, int *valor) {
+    char *fim;
+    long v;
+
+    *texto = NULL;
+    if (linha[0] == '\0') return ACAO_NENHUMA;
+    v = strtol(linha, &fim, 10);
+    if (*fim == '\0') {
+        if (v > 99999)  v = 99999;
+        if (v < -99999) v = -99999;
+        *valor = (int)v;
+        return ACAO_RESPONDER;
+    }
+    return interpretar_comando(linha, texto);
+}
+
+/* Leitura de linha SEM bloquear o jogo: se a questao abrir/fechar ou o jogo
+   acabar enquanto o jogador digita, a leitura e interrompida. */
+int ler_linha_ativa(char *buf, int tam, unsigned epoca_ini) {
+    int n = 0;
+    unsigned desenho_visto;
+
+    buf[0] = '\0';
+    pthread_mutex_lock(&mutex_jogo);
+    desenho_visto = desenho_id;
+    pthread_mutex_unlock(&mutex_jogo);
+
+    while (1) {
+        int estado = 0, c;
+
+        pthread_mutex_lock(&mutex_jogo);
+        if (!jogo_ativo)               estado = LEI_FIM;
+        else if (epoca != epoca_ini)   estado = LEI_MUDOU;
+        else if (desenho_id != desenho_visto) {      /* tela redesenhada: repoe o texto digitado */
+            desenho_visto = desenho_id;
+            printf("%s", buf);
+            fflush(stdout);
+        }
+        pthread_mutex_unlock(&mutex_jogo);
+        if (estado) return estado;
+
+        if (!_kbhit()) { Sleep(15); continue; }
+        c = _getch();
+        if (c == 0 || c == 0xE0) { (void)_getch(); continue; }   /* teclas especiais */
+
+        pthread_mutex_lock(&mutex_jogo);
+        if (c == '\r' || c == '\n') {
+            printf("\n");
+            fflush(stdout);
+            pthread_mutex_unlock(&mutex_jogo);
+            buf[n] = '\0';
+            trim(buf);
+            return LEI_LINHA;
+        }
+        if (c == 8) {                                /* backspace */
+            if (n > 0) { n--; buf[n] = '\0'; printf("\b \b"); }
+        } else if (c >= 32 && c != 127 && n < tam - 1) {
+            buf[n++] = (char)c;
+            buf[n] = '\0';
+            putchar(c);
+        }
+        fflush(stdout);
+        pthread_mutex_unlock(&mutex_jogo);
+    }
+}
+
+void executar_acao(int acao, char *texto_chat, int valor_resp) {
+
+    switch (acao) {
+    case ACAO_SAIR:
+        enviar_msg('S', meu_id, 0, 0, 'N', "");
+        encerrar_jogo(FIM_DESISTI);
+        break;
+
+    case ACAO_CHAT:
+        sanitizar_texto(texto_chat);
+        if (!enviar_msg('C', meu_id, 0, 0, 'N', texto_chat)) {
+            encerrar_jogo(FIM_CONEXAO_PERDIDA);
+        } else {
+            log_evento("Voce: %s", texto_chat);
+            desenhar_cabo();
+        }
+        break;
+
+    case ACAO_JOGAR: {
+        int  dado = rolar_dado();
+        int  resp;
+        char conta[TAM_CONTA];
+
+        if (questao_ativa) { desenhar_cabo(); break; }
+        gerar_conta(conta, sizeof(conta), &resp);
+
+        if (!enviar_msg('Q', meu_id, dado, seq_questao + 1, 'N', conta)) {
+            encerrar_jogo(FIM_CONEXAO_PERDIDA);
+            break;
+        }
+        seq_questao++;
+        abrir_questao(dado, conta, resp);
+        log_evento("Voce rolou %d%s! Resolva a conta!", dado,
+                   (dado >= DADO_CRITICO) ? " (CRITICO!)" : "");
+        desenhar_cabo();
+        break;
+    }
+
+    case ACAO_RESPONDER:
+        if (!questao_ativa || ja_respondi) {
+            desenhar_cabo();
+        } else if (valor_resp != resp_correta) {
+            log_evento("%d esta errado! Tente de novo.", valor_resp);
+            desenhar_cabo();
+        } else if (meu_id == 1) {
+            resolver_puxada(1);              /* anfitriao decide na hora */
+        } else if (!enviar_msg('A', meu_id, valor_resp, seq_questao, 'N', "")) {
+            encerrar_jogo(FIM_CONEXAO_PERDIDA);
+        } else {
+            ja_respondi = 1;
+            log_evento("Voce acertou! Aguardando confirmacao...");
+            desenhar_cabo();
+        }
+        break;
+
+    case ACAO_INVALIDA:
+        log_evento(questao_ativa ? "Comando invalido. Digite um numero, M texto ou S."
+                                 : "Comando invalido. Use ENTER, M texto ou S.");
+        desenhar_cabo();
+        break;
+
+    default:
+        desenhar_cabo();
+        break;
+    }
+}
+
+bool configurar_partida(void) {
+    char linha[TAM_LINHA], prompt[TAM_LINHA];
+    int opcao;
+
+    system("cls");
+    set_cor(COR_J1);
+    set_cor(COR_PADRAO);
+    printf("======== CABO DE GUERRA ========\n\n");
+    printf("REGRAS DO JOGO:\n");
+    printf("- Cada jogador controla um lado da corda.\n");
+    printf("- Os jogadores se revezam para ROLAR O DADO (1 a 5; o 6 e CRITICO e vale %d).\n", DADO_CRITICO);
+    printf("- Ao rolar, aparece uma CONTA de matematica para os DOIS jogadores.\n");
+    printf("- Quem acertar a resposta primeiro puxa a corda pelo valor do dado!\n");
+    printf("- Ganha a rodada quem levar a corda ate a ponta do seu lado.\n\n");
+    
+    printf("1 - Criar sala\n");
+    printf("2 - Entrar em sala\n\n");
+    
+
+    if (!ler_numero("Opcao: ", 1, 2, 1, &opcao)) return false;
+    meu_id = opcao;
+    printf("\n");
+
+    snprintf(prompt, sizeof(prompt), "Seu nome [Enter = Jogador %d]: ", meu_id);
+    if (!perguntar(prompt, linha, sizeof(linha))) return false;
+    sanitizar_texto(linha);
+    trim(linha);
+    if (linha[0] == '\0') snprintf(linha, sizeof(linha), "Jogador %d", meu_id);
+    snprintf(nome[meu_id], TAM_NOME, "%s", linha);
+
+    if (meu_id == 1 &&
+        !ler_numero("Rodadas para vencer [Enter = 4]: ", 1, RODADAS_MAX,
+                    RODADAS_PADRAO, &rodadas_para_vencer))
+        return false;
+
+    return true;
+}
+
+bool conectar(void) {
+    bool ok = (meu_id == 1) ? iniciar_servidor() : iniciar_cliente();
+
+    if (ok) {
+        int nodelay = 1;
+        setsockopt(sock_conexao, IPPROTO_TCP, TCP_NODELAY,
+                   (const char*)&nodelay, sizeof(nodelay));
+        ok = handshake();
+    }
+    return ok;
+}
+
+void resetar_partida(void) {
+    posicao_cabo      = CENTRO;
+    placar[1]         = placar[2] = 0;
+    rodada_atual      = 1;
+    jogo_ativo        = 1;
+    motivo_fim        = FIM_NENHUM;
+    log_qtd           = 0;
+    questao_ativa     = 0;
+    seq_questao       = 0;
+    ja_respondi       = 0;
+    epoca++;
+
+    primeiro_jogador = (primeiro_jogador == 1) ? 2 : 1;
+    vez = primeiro_jogador;
+    log_evento("Nova partida - comeca %s.", nome[vez]);
+    desenhar_cabo();
+}
+
+bool perguntar_revanche(void) {
+    char resp[TAM_LINHA];
+    bool quero, aceitou;
+    int motivo;
+
+    pthread_mutex_lock(&mutex_jogo);
+    motivo = motivo_fim;
+    resposta_oponente = 0;
+    pthread_mutex_unlock(&mutex_jogo);
+
+    if (motivo != FIM_VENCI && motivo != FIM_PERDI) return false;
+
+    printf("\n");
+    while (1) {
+        if (!perguntar("Jogar novamente? (S/N): ", resp, sizeof(resp))) {
+            strcpy(resp, "n");
+        }
+
+        if (strlen(resp) == 1 && (resp[0] == 's' || resp[0] == 'S' || resp[0] == 'n' || resp[0] == 'N')) {
+            break;
+        }
+        set_cor(COR_ERRO);
+        printf("Opcao invalida! Digite apenas S para sim ou N para nao.\n");
+        set_cor(COR_PADRAO);
+    }
+
+    quero = (resp[0] == 's' || resp[0] == 'S');
+
+    if (!enviar_msg('R', meu_id, 0, 0, quero ? 'S' : 'N', "")) {
+        printf("Falha ao enviar resposta de revanche.\n");
+        return false;
+    }
+    if (!quero) return false;
+
+    printf("Aguardando resposta do oponente...\n");
+    pthread_mutex_lock(&mutex_jogo);
+    while (conexao_ativa && resposta_oponente == 0)
+        pthread_cond_wait(&cond_jogo, &mutex_jogo);
+    aceitou = (resposta_oponente == 1 && conexao_ativa);
+    if (aceitou) resetar_partida();
+    pthread_mutex_unlock(&mutex_jogo);
+
+    if (!aceitou) printf("O oponente nao quer jogar novamente (ou saiu).\n");
+    return aceitou;
+}
+
+void loop_principal(void) {
+    char linha[TAM_LINHA];
+
+    while (1) {
+        bool ativo, em_resposta;
+        unsigned epoca_ini;
+        int acao, leitura, valor_resp = 0;
+        char *texto_chat;
+
+        /* Espera ate ser a minha vez de rolar OU haver uma conta para resolver */
+        pthread_mutex_lock(&mutex_jogo);
+        while (jogo_ativo && vez != meu_id && !questao_ativa)
+            pthread_cond_wait(&cond_jogo, &mutex_jogo);
+        ativo       = jogo_ativo;
+        em_resposta = questao_ativa;
+        epoca_ini   = epoca;
+        pthread_mutex_unlock(&mutex_jogo);
+
+        if (!ativo) break;
+
+        FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+        leitura = ler_linha_ativa(linha, sizeof(linha), epoca_ini);
+        if (leitura == LEI_FIM)   break;
+        if (leitura == LEI_MUDOU) continue;      /* a questao abriu/fechou: recomeca */
+
+        acao = em_resposta ? interpretar_resposta(linha, &texto_chat, &valor_resp)
+                           : interpretar_comando(linha, &texto_chat);
+
+        if (acao == ACAO_SAIR) {
+            char conf[TAM_LINHA];
+            printf("Sair da partida? (s/n): ");
+            fflush(stdout);
+            if (ler_linha_teclado(conf, sizeof(conf)) &&
+                !((conf[0] == 's' || conf[0] == 'S') && conf[1] == '\0'))
+                acao = ACAO_NENHUMA;
+        }
+
+        pthread_mutex_lock(&mutex_jogo);
+        if (!jogo_ativo) {
+            pthread_mutex_unlock(&mutex_jogo);
+            break;
+        }
+        if (acao != ACAO_SAIR && epoca != epoca_ini) {   /* estado mudou durante a confirmacao */
+            pthread_mutex_unlock(&mutex_jogo);
+            continue;
+        }
+        executar_acao(acao, texto_chat, valor_resp);
+        pthread_mutex_unlock(&mutex_jogo);
+    }
+    FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+}
+
+int main(void) {
+    WSADATA wsa;
+    pthread_t thread_id;
+
+    srand((unsigned int)time(NULL));
+    strcpy(nome[1], "Jogador 1");
+    strcpy(nome[2], "Jogador 2");
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        printf("Falha ao inicializar Winsock.\n");
+        esperar_enter();
+        return 1;
+    }
+
+    if (!configurar_partida()) {
+        WSACleanup();
+        return 1;
+    }
+
+    if (!conectar()) {
+        printf("\nErro ao iniciar.\n");
+        if (sock_conexao != INVALID_SOCKET) closesocket(sock_conexao);
+        WSACleanup();
+        esperar_enter();
+        return 1;
+    }
+
+    log_evento("%s vs %s - comeca %s.", nome[1], nome[2], nome[primeiro_jogador]);
+
+    if (pthread_create(&thread_id, NULL, thread_receber_mensagens, NULL) != 0) {
+        printf("Falha ao criar thread receptora.\n");
+        closesocket(sock_conexao);
+        WSACleanup();
+        esperar_enter();
+        return 1;
+    }
+
+    pthread_mutex_lock(&mutex_jogo);
+    desenhar_cabo();
+    pthread_mutex_unlock(&mutex_jogo);
+    do {
+        loop_principal();
+    } while (perguntar_revanche());
+
+    esperar_enter();
+
+    shutdown(sock_conexao, SD_BOTH);
+    pthread_join(thread_id, NULL);
+    closesocket(sock_conexao);
+    pthread_mutex_destroy(&mutex_jogo);
+    pthread_cond_destroy(&cond_jogo);
+    WSACleanup();
+    return 0;
+}
