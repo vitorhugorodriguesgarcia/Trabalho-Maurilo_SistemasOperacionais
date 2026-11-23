@@ -80,7 +80,7 @@ M sua mensagem: Envia uma mensagem no chat.
 
 S: Sai da partida.
 
-✒️ Autores
+✒️ Autor:
 Vitor Hugo Rodrigues Garcia 
-Livia :)
+
 
